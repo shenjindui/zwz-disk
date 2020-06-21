@@ -1,0 +1,286 @@
+<!DOCTYPE html>
+<html>
+	<head>
+		<meta charset="UTF-8">
+		<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+		<title></title>
+		<script src="../js/jquery-1.8.3.min.js"></script>
+		<script src="../js/pandyle.min.js"></script>
+		<script src="../ipaddress.js"></script>
+		<script src="../js/common.js"></script>
+		<link rel="stylesheet" href="../css/common.css" />
+		
+		<script src="../js/layui/layui.all.js"></script>
+		<link rel="stylesheet" href="../js/layui/css/layui.css" />
+		
+		<script src="../js/webuploader/webuploader.min.js"></script>
+		<link rel="stylesheet" href="../js/webuploader/webuploader.css" />
+		
+		<script type="text/javascript">
+			var vm=null;
+			var uploader=null;
+			var dataInfo={
+				"maxsize":maxsize,
+				"files":[]
+			};
+			$(function(){
+				vm=$("body").vm(dataInfo);
+				register();
+				init();
+			});
+			function register(){				
+				//document->hook下面有介绍
+				WebUploader.Uploader.register({
+					'name': 'webUploaderHookCommand',
+			    	"before-send-file":"beforeSendFile",
+			    	"before-send":"beforeSend",
+			    	"after-send-file":"afterSendFile"
+			    },{
+			        beforeSendFile:function(file) {
+			            // 创建一个deffered,用于通知是否完成操作
+			            var deferred = WebUploader.Deferred();
+			            
+			            //js-spark-md5计算md5
+			            //内置计算md5【慢，而且jpg计算不对】
+						getFileMd5(file,deferred);
+						
+						uploader.options.formData.uuid = $.getUrlParam("uuid");
+		            	uploader.options.formData.pid = $.getUrlParam("folderid");
+            			uploader.options.formData.token = $.getUrlParam("token");
+						
+            			//问题一：同时选择两个文件，大在前，小在后，则md5和filename会窜
+            			//问题二：主要如果<chunkSize，则不分块，不会有chunk和chunks两参数
+            			//问题三：内置参数chunk/chunks
+			        	if(file.size<=chunkSize){
+			        		uploader.options.formData.chunk=0;
+			        		uploader.options.formData.chunks=1;
+			        	}
+			        	
+			            return deferred.promise();// 通知完成操作
+			        },
+			        beforeSend:function(block) {
+			        },
+			        afterSendFile:function(file) {//合并切块
+			        	var node=getNode(file.id);
+			        	var url=baseurl+"disk/fileupload/mergeChunk";
+			        	var args={
+			        		"albumid":$.getUrlParam("albumid"),
+			        		"pid":$.getUrlParam("folderid"),
+			        		"relativepath":"",
+			        		"uuid":$.getUrlParam("uuid"),
+			        		"fileid":node.fileid,
+			        		"filename":node.filename,
+			        		"filemd5":node.md5,
+			        		"totalSize":file.size,
+			        		"token":$.getUrlParam("token")
+			        	};
+			        	$.post(url,args,function(data){
+			        		if(data.code==0){
+			        			updateNode(node.fileid,3,"上传成功","","");
+			        		}else{
+			        			updateNode(node.fileid,4,"上传失败",data.msg,"");
+			        		}
+			        	});
+			        }
+			    });
+			}
+			function init(){
+				uploader = WebUploader.create({
+    				swf: '../js/webuploader/Uploader.swf',
+    				server: baseurl+'disk/fileupload/uploadChunk',
+    				pick: '#picker',
+    				resize: false,
+    				auto:true,
+    				threads:threads,
+    				compress:false,//默认压缩，对jpg的md5计算产生影响
+    				chunkRetry:0,
+    				prepareNextFile:true,
+    				chunked:true,
+    				chunkSize:chunkSize,
+    				duplicate:false,//去重
+    				formData:{
+    				}
+				});
+				//第一步：加入队列
+				uploader.on('fileQueued', function( file ) {
+					addNode(file.id,file.name,file.size);
+				});
+				//第二步：上传过程计算进度
+				uploader.on('uploadProgress', function(file, percentage) {
+					var jd=(percentage * 100).toFixed(0)+"%";
+					if(jd=="100%"){
+						updateNode(file.id,2,"合并中","","");
+					}else{
+						updateNode(file.id,2,"上传中("+jd+")","","");
+					}					
+				});
+				//第三步：上传完成合并切块
+				uploader.on('uploadSuccess', function( file,response ) {
+					updateNode(file.id,3,"上传成功","","");
+					uploader.removeFile(file,true);
+				});
+				//第四步：上传失败
+				//报错让前端捕捉有两种方式：1）response.setStatus(500);   2）uploaderAccept返回false
+				uploader.on('uploadError', function( file,reason ) {
+					updateNode(file.id,4,"上传失败","","");
+					return false;
+				});
+				uploader.on('uploadAccept', function( object,res ) {
+					if(res.code==1){
+						updateNode(object.file.id,4,"上传失败",res.msg,"");
+						return false;
+					}
+				});
+			}
+			
+			function getNode(fileid){
+				var files=vm.get("files");
+				var index=null;
+				for(var i=0;i<files.length;i++){
+					if(files[i].fileid==fileid){
+						index=i;
+						break;
+					}
+				}
+				return files[index];
+			}
+			function addNode(fileid,filename,filesize){
+				var files=vm.get("files");
+				files.push({
+					"rowindex":files.length+1,
+					"fileid":fileid,
+					"filename":filename,
+					"filesize":getSize(filesize),
+					"status":0,//0等待上传，1扫描中，2上传中，3上传成功，4上传失败
+					"statusText":"等待上传"
+				});
+				vm.set({
+					"files":files
+				});
+			}
+			function updateNode(fileid,status,statusText,errormsg,md5){
+				var files=vm.get("files");
+				var index=null;
+				for(var i=0;i<files.length;i++){
+					if(files[i].fileid==fileid){
+						index=i;
+						break;
+					}
+				}
+				files[index].status=status;//0等待上传，1扫描中，2上传中，3上传成功，4上传失败
+				files[index].statusText=statusText;
+				if(errormsg!=""){
+					files[index].errormsg=errormsg;
+				}
+				if(md5!=""){
+					files[index].md5=md5;
+				}
+				vm.set({
+					"files":files
+				});
+			}
+			
+			//计算大小
+			function getSize(size){
+				var str="";
+				if(size<1024){
+					str= size+"B";
+				}else if(1024<=size&&size<1024*1024){
+					str= (size/1024).toFixed(1)+"KB";
+				}else if(1024*1024<=size&&size<1024*1024*1024){
+					str= (size/(1024*1024)).toFixed(1)+"MB";
+				}else if(1024*1024*1024<=size&&size<1024*1024*1024*1024){
+					str= (size/(1024*1024*1024)).toFixed(1)+"GB";
+				}else{
+					str= (size/(1024*1024*1024*1024)).toFixed(1)+"TB";
+				}
+				return str;
+			}
+			//计算md5
+			function getFileMd5(file,deferred){
+				//compress:false,//默认压缩，对jpg的md5计算产生影响
+				//新版jquery不进入progress
+				uploader.md5File(file).progress(function(percentage){
+	            	var jd=(percentage * 100).toFixed(0)+"%";
+	            	updateNode(file.id,1,"扫描中("+jd+")","","");
+	            	
+	            }).then(function(val) {
+					updateNode(file.id,1,"扫描中(100%)","",val);
+		            var url=baseurl+"disk/fileupload/checkFile";
+		        	var args={
+		        		"filemd5":val,
+		        		"filename":file.name,
+		        		"filesize":file.size,
+		        		"token":$.getUrlParam("token")
+		        	};
+		        	$.post(url,args,function(data){
+		        		if(data.code==0){
+		        			if(data.data==1){
+		        				uploader.skipFile(file);
+		        			}
+		        			deferred.resolve();
+		        		}else{
+		        			updateNode(file.id,4,"上传失败",data.msg,"");
+		        			deferred.reject();
+		        		}
+		        	});
+	            });
+			}
+			//展示异常
+			function showError(errormsg){
+				layer.alert(errormsg);
+			}
+			//重新上传
+			function retryFile(fileid){
+				var file=uploader.getFile(fileid);
+				uploader.retry(file);
+			}
+		</script>
+		<style>
+		</style>
+	</head>
+	<body style="padding: 0px;margin: 0px;">
+		<div class="layui-container">
+			<div class="layui-row">
+				<div class="layui-col-xs4" style="box-sizing: border-box;">
+					<span id="picker">选择文件</span>
+				</div>
+				<div class="layui-col-xs8" style="text-align: right;height: 44px;line-height: 44px;box-sizing: border-box;">
+					<span style="color: red;">{{maxsize}}</span>
+				</div>
+			</div>
+			<div class="layui-row">
+				<div class="layui-col-xs12">
+					<table class="layui-table">
+						<thead>
+							<tr>
+								<th style="width: 60px;">序号</th>
+								<th>文件名称</th>
+								<th style="width: 100px;">文件大小</th>
+								<th style="width: 200px;">上传状态</th>
+							</tr>
+						</thead>
+				    	<tbody>
+				    		<tr p-for="files">
+				    			<td>{{rowindex}}</td>
+				    			<td>{{filename}}</td>
+				    			<td>{{filesize}}</td>
+				    			<td>
+				    				<span p-if="{{status}}==0">{{statusText}}</span>
+				    				<span p-if="{{status}}==1">{{statusText}}</span>
+				    				<span p-if="{{status}}==2">{{statusText}}</span>
+				    				<span p-if="{{status}}==3" style="color: green;">{{statusText}}</span>
+				    				<span p-if="{{status}}==4" style="color: red;cursor: pointer;" p-bind="onclick:showError('{{errormsg}}')">
+				    					<span>{{statusText}}</span>
+				    					<span>(查看原因)</span>
+				    					<span style="color: blue;cursor: pointer;" p-bind="onclick:retryFile('{{fileid}}')">重传</span>
+				    				</span>
+				    			</td>
+				    		</tr>
+				    	</tbody>
+				    </table>
+				</div>
+			</div>
+		</div>
+	</body>
+</html>
